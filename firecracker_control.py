@@ -25,8 +25,8 @@ import tempfile
 import time
 import shutil
 from pathlib import Path
-from threading import Thread
 from typing import Optional
+import asyncio
 
 import requests_unixsocket
 import json
@@ -284,92 +284,74 @@ class FirecrackerVM:
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Thread-worker for the parallel test
+# Async worker for VM interaction
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 
 
-def vm_worker(idx: int, kernel: str, rootfs: str):
-    """Boot one VM, handshake with taskd, dispatch setup + verify recipes."""
+async def vm_worker(
+    idx: int,
+    kernel: str,
+    rootfs: str,
+    *,
+    setup_recipe: Path,
+    verify_recipe: Path,
+    prompt_format: str,
+    command_q: asyncio.Queue[str],
+    result_q: asyncio.Queue[str],
+):
+    """Boot one VM, execute setup & verify recipes and relay commands asynchronously."""
+
+    def _send_recipe(vm: FirecrackerVM, recipe_path: Path) -> str:
+        recipe = json.loads(recipe_path.read_text())
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(vm.vsock_socket))
+            s.sendall(b"CONNECT 52\n")
+            read_line(s)
+            handshake = (
+                json.dumps({"hello": "firecracker", "version": 1}).encode("utf-8")
+                + b"\x00"
+            )
+            s.sendall(handshake)
+            read_line(s)
+            s.sendall(json.dumps(recipe).encode("utf-8") + b"\x00")
+            return s.recv(4096).decode().strip()
+
+    vm = FirecrackerVM(kernel=kernel, rootfs=rootfs)
+    await asyncio.to_thread(vm._start)
+
     try:
-        with FirecrackerVM(kernel=kernel, rootfs=rootfs) as vm:
-            # Wait for taskd to be ready inside the guest
-            result = "NO"
-            while "task done" not in result:
-                result = vm.run("/bin/taskd 52; echo \"task\"\" done\"")
-                if "task done" not in result:
-                    time.sleep(0.2)
-            time.sleep(0.1)
+        result = "NO"
+        while "task done" not in result:
+            result = await asyncio.to_thread(
+                vm.run, "/bin/taskd 52; echo \"task done\""
+            )
+            if "task done" not in result:
+                await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
-            # Step 1: Handshake (first connection)
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.connect(str(vm.vsock_socket))
-                s.sendall(b"CONNECT 52\n")
-                banner = read_line(s).decode().strip()
+        setup_reply = await asyncio.to_thread(_send_recipe, vm, setup_recipe)
+        try:
+            values = json.loads(setup_reply)[0].get("values", [])
+        except Exception:
+            values = []
+        try:
+            prompt = prompt_format.format(*values)
+        except Exception:
+            prompt = prompt_format
+        await result_q.put(prompt)
 
-                handshake = json.dumps({ "hello": "firecracker", "version": 1 }).encode('utf-8') + b'\x00'
-                s.sendall(handshake)
-                reply = read_line(s).decode().strip()
-                try:
-                    response = json.loads(reply)
-                    if response.get("status") != 0:
-                        print(f"VM-{idx}: handshake failed → {response}")
-                        return
-                except Exception as e:
-                    print(f"VM-{idx}: invalid handshake reply → {reply!r} ({e})")
-                    return
-
-            # Step 2: Send recipes, one per connection
-            recipe_paths = [
-                Path("sm_recipes/file_copy/setup.json"),
-                Path("sm_recipes/file_copy/verify.json"),
-            ]
-
-            for path in recipe_paths:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                    s.connect(str(vm.vsock_socket))
-                    s.sendall(b"CONNECT 52\n")
-                    banner = read_line(s).decode().strip()
-
-                    # Send handshake again for each connection (as per server expectations)
-                    handshake = json.dumps({ "hello": "firecracker", "version": 1 }).encode('utf-8') + b'\x00'
-                    s.sendall(handshake)
-                    reply = read_line(s).decode().strip()
-                    try:
-                        response = json.loads(reply)
-                        if response.get("status") != 0:
-                            print(f"VM-{idx}: handshake (re)failed → {response}")
-                            return
-                    except Exception as e:
-                        print(f"VM-{idx}: invalid handshake reply (again) → {reply!r} ({e})")
-                        return
-
-                    # Send recipe
-                    recipe = json.loads(path.read_text())
-                    recipe_data = json.dumps(recipe).encode('utf-8') + b'\x00'
-                    s.sendall(recipe_data)
-                    #time.sleep(0.1)
-
-                    # Wait for response
-                    try:
-                        final_reply = s.recv(1024).decode().strip()
-                        if final_reply:
-                            print(f"VM-{idx}: report → {final_reply}")
-                        else:
-                            print(f"VM-{idx}: no report received")
-                    except Exception as e:
-                        print(f"VM-{idx}: error receiving report → {e}")
-
-                    result = vm.run("cp -r /home/jessica/Documents/important/* /home/jessica/Desktop/")
-                    #print(f"VM-{idx}: contents → {result}")
-                    result = vm.run("ls /home/jessica/Desktop")
-                    #print(f"VM-{idx}: contents → {result}")
-
-            print(f"VM-{idx}: OK")
-
-    except Exception as e:
-        print(f"VM-{idx}: FAILED → {e}")
+        while True:
+            cmd = await command_q.get()
+            if cmd is None:
+                break
+            output = await asyncio.to_thread(vm.run, cmd)
+            verify_reply = await asyncio.to_thread(_send_recipe, vm, verify_recipe)
+            report = json.dumps({"output": output, "verify": verify_reply})
+            await result_q.put(report)
+    finally:
+        await asyncio.to_thread(vm.shutdown)
 
 
 
@@ -377,25 +359,42 @@ def vm_worker(idx: int, kernel: str, rootfs: str):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
+async def main():
+    """Example entry-point that boots a single async worker."""
+
     KERNEL = "vm/vmlinux-6.1.134"
     ROOTFS = "vm/ubuntu-24.04.ext4"
 
-    threads: list[Thread] = []
-    for i in range(32):
-        t = Thread(target=vm_worker, args=(i, KERNEL, ROOTFS), daemon=True)
-        t.start()
-        threads.append(t)
-        #time.sleep(0.05)  # slight delay to avoid startup storm
+    cmd_q: asyncio.Queue[str] = asyncio.Queue()
+    result_q: asyncio.Queue[str] = asyncio.Queue()
 
-    # Wait for all workers to finish
-    for t in threads:
-        t.join()
+    worker = asyncio.create_task(
+        vm_worker(
+            0,
+            KERNEL,
+            ROOTFS,
+            setup_recipe=Path("tasks/file_copy/setup.json"),
+            verify_recipe=Path("tasks/file_copy/verify.json"),
+            prompt_format="Copy all files from {0} into {1}.",
+            command_q=cmd_q,
+            result_q=result_q,
+        )
+    )
+
+    prompt = await result_q.get()
+    print(f"Prompt → {prompt}")
+
+    cmd_q.put_nowait("echo hello")
+    report = await result_q.get()
+    print(f"Report → {report}")
+
+    cmd_q.put_nowait(None)
+    await worker
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         # Ensure every VM still tears down correctly
         pass
