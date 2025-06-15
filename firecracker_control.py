@@ -49,6 +49,20 @@ def read_line(sock: socket.socket, max_bytes: int = 256, timeout: float = 2.0) -
     sock.settimeout(timeout)
     data = b""
     try:
+        while not data.endswith(b"\x00") and len(data) < max_bytes:
+            chunk = sock.recv(1)
+            if not chunk:
+                break
+            data += chunk
+    except socket.timeout:
+        pass
+    return data
+
+def read_handshake(sock: socket.socket, max_bytes: int = 256, timeout: float = 2.0) -> bytes:
+    """Read a single line (up to *max_bytes*) from *sock*, honouring *timeout*."""
+    sock.settimeout(timeout)
+    data = b""
+    try:
         while not data.endswith(b"\n") and len(data) < max_bytes:
             chunk = sock.recv(1)
             if not chunk:
@@ -145,7 +159,6 @@ class FirecrackerVM:
             except KeyError:
                 pass
             sel.close()
-
         cleaned = clean_output(output)
         lines = cleaned.splitlines()
         for i, line in enumerate(reversed(lines)):
@@ -375,7 +388,6 @@ def snapshot_vm(
         mem_path = snapshot_path.with_suffix(snapshot_path.suffix + '.mem')
 
         resp = vm._api('PATCH', '/vm', {'state': 'Paused'})
-        #print(resp.status_code, resp.text)
         resp = vm._api(
             'PUT',
             '/snapshot/create',
@@ -385,7 +397,6 @@ def snapshot_vm(
                 'mem_file_path': str(mem_path),
             },
         )
-        #print(resp.status_code, resp.text)
         resp = vm._api('PATCH', '/vm', {'state': 'Resumed'})
 
         return resp.status_code == 204
@@ -416,7 +427,7 @@ async def vm_worker(
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.connect(str(vm.vsock_socket))
             s.sendall(b"CONNECT 52\n")
-            read_line(s)
+            read_handshake(s)
             handshake = (
                 json.dumps({"hello": "firecracker", "version": 1}).encode("utf-8")
                 + b"\x00"
@@ -424,7 +435,8 @@ async def vm_worker(
             s.sendall(handshake)
             read_line(s)
             s.sendall(json.dumps(recipe).encode("utf-8") + b"\x00")
-            return s.recv(4096).decode().strip()
+            response = s.recv(4096)
+            return response.decode().strip()
 
     snap_path = snapshot_dir / f"vm-{idx}.snap"
     vsock_path = snapshot_dir / f"vsock-{idx}.sock"
@@ -502,7 +514,7 @@ async def main():
     """Launch multiple Firecracker VMs concurrently and interact with them via asyncio queues."""
     KERNEL = "vm/vmlinux-6.1.134"
     ROOTFS = "vm/ubuntu-24.04.ext4"
-    NUM_VMS = 8  # Adjust based on your system's capacity
+    NUM_VMS = 1  # Adjust based on your system's capacity
 
     setup_recipe = Path("tasks/file_copy/setup.json")
     verify_recipe = Path("tasks/file_copy/verify.json")
@@ -533,6 +545,8 @@ async def main():
     prompts = await asyncio.gather(*[q.get() for q in result_queues])
     for idx, prompt in enumerate(prompts):
         print(f"VM-{idx}: Prompt → {prompt}")
+
+    measure = time.time()
 
     # Send a test command to each VM
     for q in command_queues:
