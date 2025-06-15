@@ -1,0 +1,16 @@
+task_id: "task_copy_contents"
+setup_recipe: "sm_recipes/file_copy/setup_custom.json"
+verification_recipe: "sm_recipes/file_copy/verify_custom.json"
+
+# Define how to extract variables from daemon output
+variables:
+  - name: source_dir
+    index: 0
+  - name: target_dir
+    index: 1
+
+prompt_template: |
+  Copy all files from `{{ source_dir }}` into `{{ target_dir }}`.
+
+metadata:
+  version: "1.0"

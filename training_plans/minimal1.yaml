@@ -1,0 +1,22 @@
+plan_id: "minimal"
+
+# Define how to extract variables from daemon output
+tasks:
+  - name: file_copy
+    index: 0
+    count: 32
+    definition: "sm_recipes/file_copy.yaml"
+
+properties:
+    pop_size: 32
+    concurrent: 32
+    generations: 100
+    sigma: 0.05
+    lr_initial: 0.1
+    lr_min: 1e-6
+    evaluation_interval: 1
+    improvement_threshold: 1
+    max_steps: 20
+
+metadata:
+  version: "1.0"

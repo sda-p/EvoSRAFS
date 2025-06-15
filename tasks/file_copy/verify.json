@@ -1,0 +1,5 @@
+[
+  { "op": "SM_OP_DIR_CONTAINS", "data": { "dest": 1, "a": 2, "b": 3 } },
+  { "op": "SM_OP_REPORT",       "data": { "regs": [1, 2, 3] } },
+  { "op": "SM_OP_RETURN",       "data": { "value": 0 } }
+]
