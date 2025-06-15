@@ -499,36 +499,55 @@ async def vm_worker(
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def main():
-    """Example entry-point that boots a single async worker."""
-
+    """Launch multiple Firecracker VMs concurrently and interact with them via asyncio queues."""
     KERNEL = "vm/vmlinux-6.1.134"
     ROOTFS = "vm/ubuntu-24.04.ext4"
+    NUM_VMS = 8  # Adjust based on your system's capacity
 
-    cmd_q: asyncio.Queue[str] = asyncio.Queue()
-    result_q: asyncio.Queue[str] = asyncio.Queue()
+    setup_recipe = Path("tasks/file_copy/setup.json")
+    verify_recipe = Path("tasks/file_copy/verify.json")
+    prompt_format = "Copy all files from {0} into {1}."
 
-    worker = asyncio.create_task(
-        vm_worker(
-            0,
-            KERNEL,
-            ROOTFS,
-            setup_recipe=Path("tasks/file_copy/setup.json"),
-            verify_recipe=Path("tasks/file_copy/verify.json"),
-            prompt_format="Copy all files from {0} into {1}.",
-            command_q=cmd_q,
-            result_q=result_q,
+    # Per-VM queues
+    command_queues = [asyncio.Queue() for _ in range(NUM_VMS)]
+    result_queues = [asyncio.Queue() for _ in range(NUM_VMS)]
+
+    # Launch all VM workers
+    workers = [
+        asyncio.create_task(
+            vm_worker(
+                idx,
+                KERNEL,
+                ROOTFS,
+                setup_recipe=setup_recipe,
+                verify_recipe=verify_recipe,
+                prompt_format=prompt_format,
+                command_q=command_queues[idx],
+                result_q=result_queues[idx],
+            )
         )
-    )
+        for idx in range(NUM_VMS)
+    ]
 
-    prompt = await result_q.get()
-    print(f"Prompt → {prompt}")
+    # Receive and print prompts
+    prompts = await asyncio.gather(*[q.get() for q in result_queues])
+    for idx, prompt in enumerate(prompts):
+        print(f"VM-{idx}: Prompt → {prompt}")
 
-    cmd_q.put_nowait("echo hello")
-    report = await result_q.get()
-    print(f"Report → {report}")
+    # Send a test command to each VM
+    for q in command_queues:
+        q.put_nowait("echo hello")
 
-    cmd_q.put_nowait(None)
-    await worker
+    # Receive and print results
+    reports = await asyncio.gather(*[q.get() for q in result_queues])
+    for idx, report in enumerate(reports):
+        print(f"VM-{idx}: Report → {report}")
+
+    # Shut down all VMs
+    for q in command_queues:
+        q.put_nowait(None)
+
+    await asyncio.gather(*workers)
 
 
 if __name__ == "__main__":
