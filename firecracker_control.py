@@ -460,7 +460,11 @@ async def vm_worker(
         result = "NO"
         while "task done" not in result:
             result = await asyncio.to_thread(
-                vm.run, "/bin/taskd 52; echo \"task done\""
+                # Do NOT merge "task" and "done" into a single string
+                # The terminal command *will* appear in the PTY output
+                # VERBATIM, we're relying on echo combining the strings
+                # into "task done" for robust verification.
+                vm.run, "/bin/taskd 52; echo \"task\" \"done\""
             )
             if "task done" not in result:
                 await asyncio.sleep(0.2)
