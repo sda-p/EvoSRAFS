@@ -1,3 +1,6 @@
 LoRA/*
 !LoRA/.gitkeep
 external/
+vm/*
+!vm/.gitkeep
+!vm/firecracker/.gitkeep
