@@ -1,11 +1,11 @@
-LoRA/*
-!LoRA/.gitkeep
-
-external/
-
+# Ignore everything inside vm/
 vm/*
-!vm/firecracker/
-!vm/firecracker/**
 
-!vm/.gitkeep
-!vm/firecracker/gitkeep
+# But allow firecracker directory itself
+!vm/firecracker/
+
+# Ignore everything inside firecracker
+vm/firecracker/**
+
+# But allow a placeholder file to keep the directory in Git
+!vm/firecracker/.gitkeep
