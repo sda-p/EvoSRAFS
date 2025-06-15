@@ -1,6 +1,0 @@
-[submodule "taskd"]
-	path = taskd
-	url = https://github.com/sda-p/taskd
-[submodule "firecracker"]
-	path = firecracker
-	url = https://github.com/firecracker-microvm/firecracker
