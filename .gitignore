@@ -9,3 +9,5 @@ vm/firecracker/**
 
 # But allow a placeholder file to keep the directory in Git
 !vm/firecracker/.gitkeep
+
+snapshots/*

@@ -374,7 +374,8 @@ def snapshot_vm(
 
         mem_path = snapshot_path.with_suffix(snapshot_path.suffix + '.mem')
 
-        vm._api('PUT', '/actions', {'action_type': 'Pause'})
+        resp = vm._api('PATCH', '/vm', {'state': 'Paused'})
+        #print(resp.status_code, resp.text)
         resp = vm._api(
             'PUT',
             '/snapshot/create',
@@ -384,7 +385,8 @@ def snapshot_vm(
                 'mem_file_path': str(mem_path),
             },
         )
-        vm._api('PUT', '/actions', {'action_type': 'Resume'})
+        #print(resp.status_code, resp.text)
+        resp = vm._api('PATCH', '/vm', {'state': 'Resumed'})
 
         return resp.status_code == 204
     except Exception:
