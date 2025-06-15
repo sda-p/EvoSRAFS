@@ -240,6 +240,62 @@ class FirecrackerVM:
         self._api("PUT", "/actions", {"action_type": "InstanceStart"})
         time.sleep(2)  # allow the guest to finish booting
 
+    def start_from_snapshot(self, snapshot_path: Path):
+        """Launch Firecracker and restore from *snapshot_path*."""
+
+        for path in (
+            self.api_socket,
+            self.vsock_socket,
+            self.serial_log,
+            self.fc_log,
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        self.master_fd, self.slave_fd = pty.openpty()
+        self.proc = subprocess.Popen(
+            [FC_BINARY, "--api-sock", str(self.api_socket)],
+            stdin=self.slave_fd,
+            stdout=self.slave_fd,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+
+        for _ in range(20):
+            if self.api_socket.exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Firecracker API socket was not created")
+
+        self._api(
+            "PUT",
+            "/logger",
+            {
+                "log_path": str(self.fc_log),
+                "level": "Info",
+                "show_level": True,
+                "show_log_origin": True,
+            },
+        )
+
+        mem_path = snapshot_path.with_suffix(snapshot_path.suffix + ".mem")
+        resp = self._api(
+            "PUT",
+            "/snapshot/load",
+            {
+                "snapshot_path": str(snapshot_path),
+                "mem_file_path": str(mem_path),
+                "resume_vm": True,
+            },
+        )
+        if resp.status_code != 204:
+            raise RuntimeError("Failed to load snapshot")
+
+        time.sleep(1)
+
     def shutdown(self):
         """Attempt graceful shutdown, escalate if needed and clean disk files."""
         if not self.proc:
@@ -288,6 +344,55 @@ class FirecrackerVM:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def snapshot_vm(
+    kernel: str,
+    rootfs: str,
+    snapshot_path: Path,
+    *,
+    vsock_socket: Optional[Path] = None,
+) -> bool:
+    """Boot a VM, wait for readiness then snapshot to *snapshot_path*.
+
+    The snapshot consists of *snapshot_path* for the VM state and a companion
+    memory file at ``snapshot_path.with_suffix(snapshot_path.suffix + '.mem')``.
+    Returns ``True`` on success, ``False`` otherwise.
+    """
+
+    vm = FirecrackerVM(kernel=kernel, rootfs=rootfs, vsock_socket=vsock_socket)
+    try:
+        vm._start()
+
+        ready = False
+        for _ in range(50):
+            output = vm.run('echo "VM" "ready"')
+            if 'VM ready' in output:
+                ready = True
+                break
+            time.sleep(0.2)
+        if not ready:
+            return False
+
+        mem_path = snapshot_path.with_suffix(snapshot_path.suffix + '.mem')
+
+        vm._api('PUT', '/actions', {'action_type': 'Pause'})
+        resp = vm._api(
+            'PUT',
+            '/snapshot/create',
+            {
+                'snapshot_type': 'Full',
+                'snapshot_path': str(snapshot_path),
+                'mem_file_path': str(mem_path),
+            },
+        )
+        vm._api('PUT', '/actions', {'action_type': 'Resume'})
+
+        return resp.status_code == 204
+    except Exception:
+        return False
+    finally:
+        vm.shutdown()
+
+
 
 
 async def vm_worker(
@@ -300,6 +405,7 @@ async def vm_worker(
     prompt_format: str,
     command_q: asyncio.Queue[str],
     result_q: asyncio.Queue[str],
+    snapshot_dir: Path = Path("snapshots"),
 ):
     """Boot one VM, execute setup & verify recipes and relay commands asynchronously."""
 
@@ -318,8 +424,35 @@ async def vm_worker(
             s.sendall(json.dumps(recipe).encode("utf-8") + b"\x00")
             return s.recv(4096).decode().strip()
 
-    vm = FirecrackerVM(kernel=kernel, rootfs=rootfs)
-    await asyncio.to_thread(vm._start)
+    snap_path = snapshot_dir / f"vm-{idx}.snap"
+    vsock_path = snapshot_dir / f"vsock-{idx}.sock"
+    api_sock = snapshot_dir / f"api-{idx}.sock"
+    serial_log = snapshot_dir / f"serial-{idx}.log"
+    fc_log = snapshot_dir / f"fc-{idx}.log"
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    if not snap_path.exists():
+        ok = await asyncio.to_thread(
+            snapshot_vm,
+            kernel,
+            rootfs,
+            snap_path,
+            vsock_socket=vsock_path,
+        )
+        if not ok:
+            await result_q.put("snapshot failed")
+            return
+
+    vm = FirecrackerVM(
+        kernel=kernel,
+        rootfs=rootfs,
+        api_socket=api_sock,
+        vsock_socket=vsock_path,
+        serial_log=serial_log,
+        fc_log=fc_log,
+    )
+    await asyncio.to_thread(vm.start_from_snapshot, snap_path)
 
     try:
         result = "NO"
